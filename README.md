@@ -75,23 +75,18 @@ outer ring to scroll. Lower `--ring` values make the ring zone wider
 
 ### Running at login
 
-Once you're happy with the options, drop a systemd user unit at
-`~/.config/systemd/user/circulartrackpad.service`:
+Once you're happy with the options, run:
 
-```ini
-[Unit]
-Description=Circular trackpad daemon
-After=graphical-session.target
-
-[Service]
-ExecStart=/usr/local/bin/circulartrackpad -p 1.5 -s 5 -r 0.65
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
+```bash
+./enable-autostart.sh -p 1.5 -s 5 -r 0.65
 ```
 
-Then `systemctl --user enable --now circulartrackpad`.
+Any arguments you pass to the script are baked into the systemd user
+unit's `ExecStart`. It writes
+`~/.config/systemd/user/circulartrackpad.service`, reloads the user
+daemon, and enables + starts the service. To change the options later
+either re-run the script or edit the unit file directly and
+`systemctl --user daemon-reload && systemctl --user restart circulartrackpad`.
 
 ## Porting to other hardware
 
