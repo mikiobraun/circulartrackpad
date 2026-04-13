@@ -1,5 +1,7 @@
 # circulartrackpad
 
+![A photo of the trackpad on my Panasonic laptop.](trackpad.jpeg)
+
 A small userspace daemon that makes the **circular ring gesture** on the
 Panasonic Let's Note trackpad work as a scroll wheel under Wayland.
 
