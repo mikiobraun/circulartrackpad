@@ -56,6 +56,7 @@ impl Default for SlotState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
 enum Zone {
     Inner,
     Ring,
@@ -122,7 +123,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut slots = [SlotState::default(); 5];
     let mut current_slot: usize = 0;
 
-    // For the primary finger (slot 0): track previous position and zone
+    // For the primary finger (slot 0): track previous position and zone.
+    // `locked_zone` is set the first time we see a new touch and stays
+    // fixed for the lifetime of that touch — whichever zone the finger
+    // started in is where it stays, so a gesture won't accidentally flip
+    // modes if the finger drifts across the threshold.
+    let mut locked_zone: Option<Zone> = None;
     let mut prev_angle: Option<f64> = None;
     let mut prev_x: Option<i32> = None;
     let mut prev_y: Option<i32> = None;
@@ -145,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if value == -1 {
                                 // Finger lifted
                                 if current_slot == 0 {
+                                    locked_zone = None;
                                     prev_angle = None;
                                     prev_x = None;
                                     prev_y = None;
@@ -188,10 +195,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let x = slot.x as f64;
                     let y = slot.y as f64;
+                    let (current_zone, _, angle) = classify(x, y, ring_threshold);
+
+                    // Lock the zone on the first frame of a new touch.
+                    let zone = *locked_zone.get_or_insert(current_zone);
+
                     let mut events_out: Vec<InputEvent> = Vec::new();
 
-                    match classify(x, y, ring_threshold) {
-                        (Zone::Ring, _, angle) => {
+                    match zone {
+                        Zone::Ring => {
                             if let Some(pa) = prev_angle {
                                 let delta = angle_delta(pa, angle);
                                 scroll_accumulator += delta * args.scroll;
@@ -208,11 +220,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             prev_angle = Some(angle);
-                            // Reset pointer tracking when in ring
-                            prev_x = None;
-                            prev_y = None;
                         }
-                        (Zone::Inner, _, _) => {
+                        Zone::Inner => {
                             if let (Some(px), Some(py)) = (prev_x, prev_y) {
                                 let dx = ((slot.x - px) as f64 * args.pointer) as i32;
                                 let dy = ((slot.y - py) as f64 * args.pointer) as i32;
@@ -233,9 +242,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             prev_x = Some(slot.x);
                             prev_y = Some(slot.y);
-                            // Reset ring tracking when in inner zone
-                            prev_angle = None;
-                            scroll_accumulator = 0.0;
                         }
                     }
 
