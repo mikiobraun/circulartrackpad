@@ -111,6 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rel_axes.insert(RelativeAxisType::REL_Y);
     rel_axes.insert(RelativeAxisType::REL_WHEEL);
     rel_axes.insert(RelativeAxisType::REL_HWHEEL);
+    rel_axes.insert(RelativeAxisType::REL_WHEEL_HI_RES);
+    rel_axes.insert(RelativeAxisType::REL_HWHEEL_HI_RES);
 
     let mut vdev = VirtualDeviceBuilder::new()?
         .name("circulartrackpad")
@@ -132,7 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_angle: Option<f64> = None;
     let mut prev_x: Option<i32> = None;
     let mut prev_y: Option<i32> = None;
-    let mut scroll_accumulator: f64 = 0.0;
+    let mut scroll_accumulator: f64 = 0.0; // fractional hi-res units (1/120 detent)
+    let mut detent_carry: i32 = 0; // integer hi-res units pending a detent
 
     loop {
         for event in dev.fetch_events()? {
@@ -156,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     prev_x = None;
                                     prev_y = None;
                                     scroll_accumulator = 0.0;
+                                    detent_carry = 0;
                                 }
                             }
                         }
@@ -205,18 +209,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match zone {
                         Zone::Ring => {
                             if let Some(pa) = prev_angle {
+                                // High-resolution scroll: 120 units = 1 detent.
+                                // scroll_accumulator holds fractional hi-res
+                                // units; we emit the integer portion each
+                                // frame as REL_WHEEL_HI_RES and emit integer
+                                // REL_WHEEL only when crossing a full detent
+                                // (for apps that don't consume HI_RES).
                                 let delta = angle_delta(pa, angle);
-                                scroll_accumulator += delta * args.scroll;
+                                scroll_accumulator +=
+                                    delta * args.scroll * 120.0 * scroll_sign;
 
-                                // Emit integer ticks, keep fractional remainder
-                                let ticks = scroll_accumulator as i32;
-                                if ticks != 0 {
-                                    scroll_accumulator -= ticks as f64;
+                                let hires = scroll_accumulator.trunc() as i32;
+                                if hires != 0 {
+                                    scroll_accumulator -= hires as f64;
                                     events_out.push(InputEvent::new(
                                         EventType::RELATIVE,
-                                        RelativeAxisType::REL_WHEEL.0,
-                                        (scroll_sign * ticks as f64) as i32,
+                                        RelativeAxisType::REL_WHEEL_HI_RES.0,
+                                        hires,
                                     ));
+
+                                    detent_carry += hires;
+                                    let detents = detent_carry / 120;
+                                    if detents != 0 {
+                                        detent_carry -= detents * 120;
+                                        events_out.push(InputEvent::new(
+                                            EventType::RELATIVE,
+                                            RelativeAxisType::REL_WHEEL.0,
+                                            detents,
+                                        ));
+                                    }
                                 }
                             }
                             prev_angle = Some(angle);
