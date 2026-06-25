@@ -20,8 +20,10 @@ struct Args {
     #[arg(short, long, default_value_t = 1.5)]
     pointer: f64,
 
-    /// Scroll sensitivity (REL_WHEEL ticks per radian of ring rotation)
-    #[arg(short, long, default_value_t = 5.0)]
+    /// Scroll sensitivity: hi-res scroll units per device unit of arc length
+    /// along the virtual scroll wheel's rim. Calibrated so the default feel
+    /// roughly matches one full revolution ≈ five screens of scroll.
+    #[arg(short, long, default_value_t = 2.75)]
     scroll: f64,
 
     /// Ring threshold as fraction of max radius (0.0-1.0). Lower = wider ring.
@@ -87,6 +89,14 @@ fn angle_delta(prev: f64, curr: f64) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let ring_threshold = MAX_RADIUS * args.ring;
+    // Fixed reference radius for the "virtual scroll wheel" model: the
+    // middle of the ring zone. Using a constant reference radius
+    // (rather than the finger's instantaneous radius) keeps scroll
+    // angle-based: same angular rotation = same scroll regardless of
+    // where the finger actually is within the ring, so rotating
+    // tightly near the centre (physiologically faster) accelerates
+    // scroll naturally.
+    let ring_reference_radius = (MAX_RADIUS + ring_threshold) / 2.0;
     let scroll_sign = if args.invert_scroll { 1.0 } else { -1.0 };
 
     println!("circulartrackpad: opening {}", args.device);
@@ -209,15 +219,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match zone {
                         Zone::Ring => {
                             if let Some(pa) = prev_angle {
-                                // High-resolution scroll: 120 units = 1 detent.
-                                // scroll_accumulator holds fractional hi-res
-                                // units; we emit the integer portion each
-                                // frame as REL_WHEEL_HI_RES and emit integer
-                                // REL_WHEEL only when crossing a full detent
-                                // (for apps that don't consume HI_RES).
+                                // Model the ring as a virtual scroll wheel:
+                                // arc length on a circle of
+                                // ring_reference_radius, fed through
+                                // scroll_accumulator and emitted as hi-res
+                                // scroll (1/120 detent units). Emit the
+                                // integer portion each frame as
+                                // REL_WHEEL_HI_RES and emit integer REL_WHEEL
+                                // only when crossing a full detent (for apps
+                                // that don't consume HI_RES).
                                 let delta = angle_delta(pa, angle);
+                                let arc = delta * ring_reference_radius;
                                 scroll_accumulator +=
-                                    delta * args.scroll * 120.0 * scroll_sign;
+                                    arc * args.scroll * scroll_sign;
 
                                 let hires = scroll_accumulator.trunc() as i32;
                                 if hires != 0 {
