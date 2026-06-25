@@ -9,6 +9,14 @@ const CENTER_X: f64 = PAD_MAX / 2.0;
 const CENTER_Y: f64 = PAD_MAX / 2.0;
 const MAX_RADIUS: f64 = PAD_MAX / 2.0;
 
+// Near dead-centre the polar angle becomes meaningless: atan2 swings by π
+// across a one-pixel crossing of the origin, and even slight noise on dx
+// or dy produces wild angle deltas. Within this radius we pause scroll
+// emission and re-baseline prev_angle on exit. The threshold is in
+// device units; 18 ≈ 1.5mm at 12 units/mm, small enough to be invisible
+// in normal use but big enough to absorb the singularity at the origin.
+const DEAD_ZONE_RADIUS_SQ: f64 = 18.0 * 18.0;
+
 #[derive(Parser, Debug)]
 #[command(about = "Userspace daemon for the Panasonic Let's Note circular trackpad")]
 struct Args {
@@ -199,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let x = slot.x as f64;
                     let y = slot.y as f64;
-                    let (current_zone, _, angle) = classify(x, y, ring_threshold);
+                    let (current_zone, r, angle) = classify(x, y, ring_threshold);
 
                     // Lock the zone on the first frame of a new touch.
                     let zone = *locked_zone.get_or_insert(current_zone);
@@ -208,39 +216,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match zone {
                         Zone::Ring => {
-                            if let Some(pa) = prev_angle {
-                                // High-resolution scroll: 120 units = 1 detent.
-                                // scroll_accumulator holds fractional hi-res
-                                // units; we emit the integer portion each
-                                // frame as REL_WHEEL_HI_RES and emit integer
-                                // REL_WHEEL only when crossing a full detent
-                                // (for apps that don't consume HI_RES).
-                                let delta = angle_delta(pa, angle);
-                                scroll_accumulator +=
-                                    delta * args.scroll * 120.0 * scroll_sign;
+                            if r * r < DEAD_ZONE_RADIUS_SQ {
+                                // Finger too close to centre for a
+                                // meaningful angle: atan2 is unstable
+                                // here and a crossing of dead centre
+                                // would otherwise produce a ±π spike.
+                                // Pause scroll and clear prev_angle so
+                                // the next frame outside the dead zone
+                                // re-baselines from a fresh anchor.
+                                prev_angle = None;
+                            } else {
+                                if let Some(pa) = prev_angle {
+                                    // High-resolution scroll: 120 units = 1 detent.
+                                    // scroll_accumulator holds fractional hi-res
+                                    // units; we emit the integer portion each
+                                    // frame as REL_WHEEL_HI_RES and emit integer
+                                    // REL_WHEEL only when crossing a full detent
+                                    // (for apps that don't consume HI_RES).
+                                    let delta = angle_delta(pa, angle);
+                                    scroll_accumulator +=
+                                        delta * args.scroll * 120.0 * scroll_sign;
 
-                                let hires = scroll_accumulator.trunc() as i32;
-                                if hires != 0 {
-                                    scroll_accumulator -= hires as f64;
-                                    events_out.push(InputEvent::new(
-                                        EventType::RELATIVE,
-                                        RelativeAxisType::REL_WHEEL_HI_RES.0,
-                                        hires,
-                                    ));
-
-                                    detent_carry += hires;
-                                    let detents = detent_carry / 120;
-                                    if detents != 0 {
-                                        detent_carry -= detents * 120;
+                                    let hires = scroll_accumulator.trunc() as i32;
+                                    if hires != 0 {
+                                        scroll_accumulator -= hires as f64;
                                         events_out.push(InputEvent::new(
                                             EventType::RELATIVE,
-                                            RelativeAxisType::REL_WHEEL.0,
-                                            detents,
+                                            RelativeAxisType::REL_WHEEL_HI_RES.0,
+                                            hires,
                                         ));
+
+                                        detent_carry += hires;
+                                        let detents = detent_carry / 120;
+                                        if detents != 0 {
+                                            detent_carry -= detents * 120;
+                                            events_out.push(InputEvent::new(
+                                                EventType::RELATIVE,
+                                                RelativeAxisType::REL_WHEEL.0,
+                                                detents,
+                                            ));
+                                        }
                                     }
                                 }
+                                prev_angle = Some(angle);
                             }
-                            prev_angle = Some(angle);
                         }
                         Zone::Inner => {
                             if let (Some(px), Some(py)) = (prev_x, prev_y) {
