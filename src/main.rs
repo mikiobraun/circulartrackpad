@@ -2,6 +2,7 @@ use clap::Parser;
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Device, EventType, InputEvent, Key, RelativeAxisType};
 use std::f64::consts::PI;
+use std::path::PathBuf;
 
 // -- Trackpad geometry (from evtest: ABS_X/ABS_Y range 0..528) --
 const PAD_MAX: f64 = 528.0;
@@ -9,12 +10,19 @@ const CENTER_X: f64 = PAD_MAX / 2.0;
 const CENTER_Y: f64 = PAD_MAX / 2.0;
 const MAX_RADIUS: f64 = PAD_MAX / 2.0;
 
+// Synaptics TM3562-003 as shipped in the Panasonic Let's Note CF-SV1.
+// We identify the touchpad by these IDs so the daemon works regardless
+// of which /dev/input/eventN node the kernel happens to assign on a
+// given boot.
+const TOUCHPAD_VENDOR: u16 = 0x06cb;
+const TOUCHPAD_PRODUCT: u16 = 0xcdea;
+
 #[derive(Parser, Debug)]
 #[command(about = "Userspace daemon for the Panasonic Let's Note circular trackpad")]
 struct Args {
-    /// Input device path
-    #[arg(short, long, default_value = "/dev/input/event3")]
-    device: String,
+    /// Input device path (auto-detected by vendor/product ID if omitted)
+    #[arg(short, long)]
+    device: Option<String>,
 
     /// Pointer sensitivity (multiplier on raw ABS deltas)
     #[arg(short, long, default_value_t = 1.5)]
@@ -84,13 +92,47 @@ fn angle_delta(prev: f64, curr: f64) -> f64 {
     d
 }
 
+/// Walk /dev/input/event* and return the path of the first device
+/// whose USB/I²C vendor and product IDs match our touchpad. Returns
+/// an error listing all detected devices if no match is found, so the
+/// user can pick one manually with --device.
+fn find_touchpad() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    for (path, dev) in evdev::enumerate() {
+        let id = dev.input_id();
+        let name = dev.name().unwrap_or("unknown").to_string();
+        candidates.push(format!(
+            "  {} — '{}' (vendor={:04x} product={:04x})",
+            path.display(),
+            name,
+            id.vendor(),
+            id.product()
+        ));
+        if id.vendor() == TOUCHPAD_VENDOR && id.product() == TOUCHPAD_PRODUCT {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "no touchpad with vendor={:04x} product={:04x} found. Detected devices:\n{}\n\
+         Use --device to pick one explicitly.",
+        TOUCHPAD_VENDOR,
+        TOUCHPAD_PRODUCT,
+        candidates.join("\n")
+    )
+    .into())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let ring_threshold = MAX_RADIUS * args.ring;
     let scroll_sign = if args.invert_scroll { 1.0 } else { -1.0 };
 
-    println!("circulartrackpad: opening {}", args.device);
-    let mut dev = Device::open(&args.device)?;
+    let device_path: PathBuf = match args.device {
+        Some(p) => PathBuf::from(p),
+        None => find_touchpad()?,
+    };
+    println!("circulartrackpad: opening {}", device_path.display());
+    let mut dev = Device::open(&device_path)?;
     println!(
         "circulartrackpad: grabbed '{}' (pointer={}, scroll={}, ring={})",
         dev.name().unwrap_or("unknown"),
