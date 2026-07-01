@@ -69,11 +69,21 @@ circulartrackpad [OPTIONS]
   -s, --scroll <SCROLL>    Scroll ticks per radian of ring rotation [default: 5]
   -r, --ring <RING>        Ring threshold as fraction of max radius [default: 0.65]
   -i, --invert-scroll      Invert scroll direction
+      --no-tap             Disable tap-to-click
+      --tap-timeout <MS>   Tap timeout in milliseconds [default: 180]
+      --tap-move-threshold <UNITS>
+                           Tap movement threshold in raw coordinate units [default: 20]
 ```
 
 Touch the inner area to move the pointer; slide your finger around the
 outer ring to scroll. Lower `--ring` values make the ring zone wider
 (easier to stay in while scrolling); higher values make it thinner.
+
+Tap-to-click is enabled by default: a quick, single-finger tap in the
+inner zone emits a left button click, and a quick two-finger tap emits a
+right button click. Use `--no-tap` to disable this, or adjust the
+`--tap-timeout` and `--tap-move-threshold` if you find taps are being
+missed or triggered accidentally.
 
 ### Running at login
 
@@ -114,7 +124,11 @@ primary finger):
   scroll ticks, and emit `REL_WHEEL`.
 - Otherwise it's in the **inner zone**: emit `REL_X` / `REL_Y` deltas.
 
-Button events (`BTN_LEFT`, `BTN_RIGHT`) are forwarded unchanged.
+Physical button events (`BTN_LEFT`, `BTN_RIGHT`) are forwarded unchanged.
+In addition, because the daemon exclusively grabs the real touchpad,
+tap-to-click is implemented in userspace: a short, single-finger touch in
+the inner zone synthesizes `BTN_LEFT`, and a short two-finger touch
+synthesizes `BTN_RIGHT`.
 
 ## License
 

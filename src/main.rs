@@ -2,6 +2,7 @@ use clap::Parser;
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Device, EventType, InputEvent, Key, RelativeAxisType};
 use std::f64::consts::PI;
+use std::time::{Duration, Instant};
 
 // -- Trackpad geometry (from evtest: ABS_X/ABS_Y range 0..528) --
 const PAD_MAX: f64 = 528.0;
@@ -31,6 +32,18 @@ struct Args {
     /// Invert scroll direction
     #[arg(short, long, default_value_t = false)]
     invert_scroll: bool,
+
+    /// Disable tap-to-click
+    #[arg(long, default_value_t = false)]
+    no_tap: bool,
+
+    /// Tap timeout in milliseconds
+    #[arg(long, default_value_t = 180)]
+    tap_timeout: u64,
+
+    /// Tap movement threshold in raw coordinate units
+    #[arg(long, default_value_t = 20)]
+    tap_move_threshold: i32,
 }
 
 // ABS event codes (not all are in evdev's typed enums)
@@ -54,6 +67,13 @@ impl Default for SlotState {
             y: 0,
         }
     }
+}
+
+#[derive(Default, Clone)]
+struct TapState {
+    start_time: Option<Instant>,
+    start_pos: Option<(i32, i32)>,
+    has_moved: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -137,6 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scroll_accumulator: f64 = 0.0; // fractional hi-res units (1/120 detent)
     let mut detent_carry: i32 = 0; // integer hi-res units pending a detent
 
+    let tap_enabled = !args.no_tap;
+    let tap_timeout = Duration::from_millis(args.tap_timeout);
+    let tap_move_threshold = args.tap_move_threshold;
+    let mut tap_states: [TapState; 5] = std::array::from_fn(|_| TapState::default());
+
     loop {
         for event in dev.fetch_events()? {
             let etype = event.event_type();
@@ -154,13 +179,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if value == -1 {
                                 // Finger lifted
                                 if current_slot == 0 {
+                                    if tap_enabled {
+                                        let s0_valid = tap_states[0]
+                                            .start_time
+                                            .map(|t| t.elapsed() <= tap_timeout)
+                                            .unwrap_or(false)
+                                            && !tap_states[0].has_moved
+                                            && locked_zone == Some(Zone::Inner);
+                                        let s1_valid = tap_states[1]
+                                            .start_time
+                                            .map(|t| t.elapsed() <= tap_timeout)
+                                            .unwrap_or(false)
+                                            && !tap_states[1].has_moved;
+                                        let s1_down = slots[1].tracking_id != -1;
+
+                                        if s1_down && s0_valid && s1_valid {
+                                            // Two-finger tap -> right click
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_RIGHT.0,
+                                                1,
+                                            )])?;
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_RIGHT.0,
+                                                0,
+                                            )])?;
+                                        } else if s0_valid && !s1_down {
+                                            // Single-finger tap -> left click
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_LEFT.0,
+                                                1,
+                                            )])?;
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_LEFT.0,
+                                                0,
+                                            )])?;
+                                        }
+                                    }
+
                                     locked_zone = None;
                                     prev_angle = None;
                                     prev_x = None;
                                     prev_y = None;
                                     scroll_accumulator = 0.0;
                                     detent_carry = 0;
+                                    tap_states[0] = TapState::default();
+                                    tap_states[1] = TapState::default();
+                                } else if current_slot == 1 {
+                                    if tap_enabled {
+                                        let s0_down = slots[0].tracking_id != -1;
+                                        let s0_valid = tap_states[0]
+                                            .start_time
+                                            .map(|t| t.elapsed() <= tap_timeout)
+                                            .unwrap_or(false)
+                                            && !tap_states[0].has_moved
+                                            && locked_zone == Some(Zone::Inner);
+                                        let s1_valid = tap_states[1]
+                                            .start_time
+                                            .map(|t| t.elapsed() <= tap_timeout)
+                                            .unwrap_or(false)
+                                            && !tap_states[1].has_moved;
+
+                                        if s0_down && s0_valid && s1_valid {
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_RIGHT.0,
+                                                1,
+                                            )])?;
+                                            vdev.emit(&[InputEvent::new(
+                                                EventType::KEY,
+                                                Key::BTN_RIGHT.0,
+                                                0,
+                                            )])?;
+                                            tap_states[0] = TapState::default();
+                                        }
+                                    }
+                                    tap_states[1] = TapState::default();
                                 }
+                            } else if current_slot < tap_states.len() {
+                                // Finger down
+                                tap_states[current_slot] = TapState {
+                                    start_time: Some(Instant::now()),
+                                    start_pos: None,
+                                    has_moved: false,
+                                };
                             }
                         }
                     }
@@ -191,6 +296,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 EventType::SYNCHRONIZATION => {
+                    // Update tap-detection state for active slots.
+                    for slot_idx in 0..2 {
+                        let slot = &slots[slot_idx];
+                        if slot.tracking_id == -1 {
+                            continue;
+                        }
+                        if tap_states[slot_idx].start_time.is_some()
+                            && tap_states[slot_idx].start_pos.is_none()
+                        {
+                            tap_states[slot_idx].start_pos = Some((slot.x, slot.y));
+                        }
+                        if let Some((sx, sy)) = tap_states[slot_idx].start_pos {
+                            let dx = slot.x - sx;
+                            let dy = slot.y - sy;
+                            if dx.abs() > tap_move_threshold || dy.abs() > tap_move_threshold {
+                                tap_states[slot_idx].has_moved = true;
+                            }
+                        }
+                    }
+
                     // On SYN_REPORT, process the primary finger (slot 0)
                     let slot = &slots[0];
                     if slot.tracking_id == -1 {
