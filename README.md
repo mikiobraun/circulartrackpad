@@ -69,7 +69,17 @@ circulartrackpad [OPTIONS]
   -s, --scroll <SCROLL>    Scroll ticks per radian of ring rotation [default: 5]
   -r, --ring <RING>        Ring threshold as fraction of max radius [default: 0.65]
   -i, --invert-scroll      Invert scroll direction
+      --no-tap             Disable tap-to-click
+      --tap-time <MS>      Max touch duration counted as a tap [default: 180]
+      --tap-move <FRAC>    Max finger travel during a tap, as fraction of pad size [default: 0.03]
+      --no-drag            Disable tap-and-drag
+      --drag-time <MS>     Window after a tap to touch again and start a drag [default: 200]
 ```
+
+Tap with one finger for a left click, two fingers for a right click,
+three fingers for a middle click. To drag, tap once and then put your
+finger back down within `--drag-time` and move it: the left button is held
+until you lift. A quick second tap instead gives a double-click.
 
 Touch the inner area to move the pointer; slide your finger around the
 outer ring to scroll. Lower `--ring` values make the ring zone wider

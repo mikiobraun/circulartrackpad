@@ -2,6 +2,8 @@ use clap::Parser;
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Device, EventType, InputEvent, Key, RelativeAxisType};
 use std::f64::consts::PI;
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 // -- Trackpad geometry (from evtest: ABS_X/ABS_Y range 0..528) --
 const PAD_MAX: f64 = 528.0;
@@ -31,6 +33,38 @@ struct Args {
     /// Invert scroll direction
     #[arg(short, long, default_value_t = false)]
     invert_scroll: bool,
+
+    /// Disable tap-to-click (1 finger = left, 2 = right, 3 = middle)
+    #[arg(long, default_value_t = false)]
+    no_tap: bool,
+
+    /// Maximum touch duration in milliseconds that still counts as a tap
+    #[arg(long, default_value_t = 180)]
+    tap_time: u64,
+
+    /// Maximum finger travel during a tap, as fraction of pad size
+    #[arg(long, default_value_t = 0.03)]
+    tap_move: f64,
+
+    /// Disable tap-and-drag (tap, then touch again and move to drag)
+    #[arg(long, default_value_t = false)]
+    no_drag: bool,
+
+    /// Time in milliseconds after a tap to touch again and start a drag
+    #[arg(long, default_value_t = 200)]
+    drag_time: u64,
+}
+
+/// Tap-and-drag state machine for the left button.
+#[derive(Clone, Copy, PartialEq)]
+enum DragState {
+    /// Nothing held.
+    Idle,
+    /// A 1-finger tap just happened; BTN_LEFT is held down. If a new touch
+    /// starts before the deadline it becomes a drag, otherwise release.
+    TapPending(Instant),
+    /// BTN_LEFT held while a finger moves; released when the touch ends.
+    Dragging,
 }
 
 // ABS event codes (not all are in evdev's typed enums)
@@ -137,7 +171,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scroll_accumulator: f64 = 0.0; // fractional hi-res units (1/120 detent)
     let mut detent_carry: i32 = 0; // integer hi-res units pending a detent
 
+    // -- Tap-to-click state --
+    // A "touch session" starts when the first finger lands on an empty pad
+    // and ends when the last finger lifts. It is a tap if it was short,
+    // the primary finger barely moved, and no physical button was pressed.
+    let tap_enabled = !args.no_tap;
+    let tap_max_time = Duration::from_millis(args.tap_time);
+    let tap_max_move = PAD_MAX * args.tap_move;
+    let mut session_start: Option<Instant> = None;
+    let mut session_max_fingers: usize = 0;
+    let mut session_origin: Option<(i32, i32)> = None;
+    let mut session_moved = false;
+    let mut session_button = false;
+    // Set when the last finger lifts: Some(tap result) at the next SYN.
+    let mut session_end: Option<Option<Key>> = None;
+    let drag_enabled = !args.no_drag;
+    let drag_timeout = Duration::from_millis(args.drag_time);
+    let mut drag_state = DragState::Idle;
+    let fd = dev.as_raw_fd();
+
     loop {
+        // While a tap is waiting for a possible drag, wait for input with a
+        // timeout so the button can be released if no second touch comes.
+        if let DragState::TapPending(deadline) = drag_state {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err.into());
+                }
+                continue;
+            }
+            if ready == 0 {
+                vdev.emit(&[InputEvent::new(EventType::KEY, Key::BTN_LEFT.code(), 0)])?;
+                drag_state = DragState::Idle;
+                continue;
+            }
+        }
+
         for event in dev.fetch_events()? {
             let etype = event.event_type();
             let code = event.code();
@@ -149,8 +227,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current_slot = value as usize;
                     }
                     ABS_MT_TRACKING_ID => {
-                        if let Some(slot) = slots.get_mut(current_slot) {
-                            slot.tracking_id = value;
+                        let was_empty = slots.iter().all(|s| s.tracking_id == -1);
+                        if current_slot < slots.len() {
+                            slots[current_slot].tracking_id = value;
+                            let active =
+                                slots.iter().filter(|s| s.tracking_id != -1).count();
+                            if value != -1 {
+                                if was_empty {
+                                    session_start = Some(Instant::now());
+                                    session_max_fingers = 0;
+                                    session_origin = None;
+                                    session_moved = false;
+                                    session_button = false;
+                                    if let DragState::TapPending(_) = drag_state {
+                                        // Touched again right after a tap:
+                                        // start dragging. Force pointer mode
+                                        // so a drag never turns into scroll.
+                                        drag_state = DragState::Dragging;
+                                        if current_slot == 0 {
+                                            locked_zone = Some(Zone::Inner);
+                                        }
+                                    }
+                                }
+                                session_max_fingers = session_max_fingers.max(active);
+                            } else if active == 0 {
+                                // Last finger lifted: decide whether it was a tap.
+                                if let Some(start) = session_start.take() {
+                                    let mut tap = None;
+                                    if tap_enabled
+                                        && !session_moved
+                                        && !session_button
+                                        && start.elapsed() <= tap_max_time
+                                    {
+                                        tap = match session_max_fingers {
+                                            1 => Some(Key::BTN_LEFT),
+                                            2 => Some(Key::BTN_RIGHT),
+                                            3 => Some(Key::BTN_MIDDLE),
+                                            _ => None,
+                                        };
+                                    }
+                                    session_end = Some(tap);
+                                }
+                            }
                             if value == -1 {
                                 // Finger lifted
                                 if current_slot == 0 {
@@ -184,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             || c == Key::BTN_RIGHT.code()
                             || c == Key::BTN_MIDDLE.code() =>
                         {
+                            session_button = true;
                             vdev.emit(&[event])?;
                         }
                         _ => {}
@@ -191,10 +310,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 EventType::SYNCHRONIZATION => {
+                    if let Some(tap) = session_end.take() {
+                        let press = |v: &mut evdev::uinput::VirtualDevice, b: Key, val| {
+                            v.emit(&[InputEvent::new(EventType::KEY, b.code(), val)])
+                        };
+                        if drag_state == DragState::Dragging {
+                            // End of drag. If the second touch was itself a
+                            // tap, this was a double-tap: emit a second click.
+                            press(&mut vdev, Key::BTN_LEFT, 0)?;
+                            if tap == Some(Key::BTN_LEFT) {
+                                press(&mut vdev, Key::BTN_LEFT, 1)?;
+                                press(&mut vdev, Key::BTN_LEFT, 0)?;
+                            }
+                            drag_state = DragState::Idle;
+                        } else if let Some(btn) = tap {
+                            press(&mut vdev, btn, 1)?;
+                            if btn == Key::BTN_LEFT && drag_enabled {
+                                drag_state =
+                                    DragState::TapPending(Instant::now() + drag_timeout);
+                            } else {
+                                press(&mut vdev, btn, 0)?;
+                            }
+                        }
+                    }
+
                     // On SYN_REPORT, process the primary finger (slot 0)
                     let slot = &slots[0];
                     if slot.tracking_id == -1 {
                         continue;
+                    }
+
+                    // Track travel since touch-down to rule out taps.
+                    let (ox, oy) = *session_origin.get_or_insert((slot.x, slot.y));
+                    let travel = (((slot.x - ox).pow(2) + (slot.y - oy).pow(2)) as f64).sqrt();
+                    if travel > tap_max_move {
+                        session_moved = true;
                     }
 
                     let x = slot.x as f64;
