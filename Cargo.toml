@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 evdev = "0.12"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
