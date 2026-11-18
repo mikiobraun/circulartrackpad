@@ -24,9 +24,9 @@ KDE, Sway, or anything else — no extensions or plugins needed.
 
 ## Hardware
 
-Developed and tested on a Panasonic Let's Note with a
+Developed and tested on a Panasonic Let's Note CF-SV1 with a
 **Synaptics TM3562-003** touchpad (HID `06cb:cdea`). Other Let's Note
-models with a different touchpad controller will need the vendor/product
+models with a different touchpad controller (such as the CF-FV) will need the vendor/product
 IDs in `install.sh` and the coordinate range in `src/main.rs` adjusted —
 see *Porting* below.
 
@@ -111,6 +111,18 @@ range, two spots need updating:
    from 0 to 528. Check your device with `sudo evtest` and adjust if
    different. The classifier assumes a square, circular pad centered on
    the origin of the coordinate space.
+
+### Let's Note CF-FV
+
+The CF-FV uses a different Synaptics controller (HID `06cb:cfb1`) with
+an `ABS_X`/`ABS_Y` range of 0 to 771. To run on it, change:
+
+- `install.sh`: `PRODUCT_ID="cfb1"`
+- `src/main.rs`: `const PAD_MAX: f64 = 771.0;`
+
+Then run `./install.sh` again. The device node may not be
+`/dev/input/event3`; find the right one with `sudo evtest` and pass it
+with `--device`.
 
 ## How it works
 
